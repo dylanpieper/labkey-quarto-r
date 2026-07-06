@@ -1,0 +1,12 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+/.quarto/
+_site/
+*.html
+*_files/
+
+# Data is pulled fresh from the LabKey API on every render — runtime scratch,
+# created by the script and never committed.
+/data/

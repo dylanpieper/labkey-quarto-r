@@ -1,0 +1,346 @@
+---
+title: "HIV Study Dashboard"
+format:
+  dashboard:
+    theme: simplex
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{=html}
+<style>
+.bslib-value-box .bslib-full-screen-enter {
+  display: none !important;
+}
+</style>
+```
+
+```{r}
+#| include: false
+
+library(httr2)
+library(dplyr)
+library(purrr)
+library(plotly)
+library(bslib)
+library(readr)
+
+# LabKey helpers ----
+
+base_url <- "https://www.labkey.org"
+container_path <- "home/Demos/HIV Study Tutorial"
+
+# Streams the TSV export to disk (req_perform path=) then reads it back, so peak
+# memory stays bounded by curl's buffer, not the result-set size. FieldKey gives
+# machine-friendly column names; maxRows=-1 lifts LabKey's default 100-row cap.
+data_dir <- "data"
+
+lk_export_rows <- function(
+  schema_name,
+  query_name,
+  columns = NULL,
+  dest = file.path(data_dir, paste0(query_name, ".tsv"))
+) {
+  request_url <- paste0(
+    base_url,
+    "/",
+    utils::URLencode(container_path),
+    "/query-exportRowsTsv.api"
+  )
+
+  dir.create(dirname(dest), showWarnings = FALSE, recursive = TRUE)
+
+  request(request_url) |>
+    req_url_query(
+      schemaName = schema_name,
+      `query.queryName` = query_name,
+      `query.columns` = columns,
+      headerType = "FieldKey",
+      `query.maxRows` = -1
+    ) |>
+    req_perform(path = dest)
+
+  read_tsv(dest, show_col_types = FALSE)
+}
+
+# Formatting helpers ----
+
+prettify_label <- function(x) {
+  x |>
+    gsub("_", " ", x = _) |>
+    gsub("([a-z])([A-Z])", "\\1 \\2", x = _) |>
+    tools::toTitleCase()
+}
+
+first_numeric_col <- function(df) {
+  df |>
+    select(where(is.numeric)) |>
+    select(-matches("participant|visit|date", ignore.case = TRUE)) |>
+    names() |>
+    pluck(1)
+}
+
+# Plotting ----
+
+cohort_colors <- c(
+  "No Treatment" = "#C1652E",
+  "DRV" = "#2E5C8A",
+  "ETR" = "#7A8C42"
+)
+
+plot_mean_trend <- function(df, demographics) {
+  y_col <- first_numeric_col(df)
+
+  # Append the participant count to each cohort's legend entry, e.g. "DRV (n=3)".
+  cohort_n <- demographics |>
+    distinct(ParticipantId, cohort) |>
+    count(cohort, name = "n")
+
+  label_for <- function(cohort_name) {
+    n <- cohort_n$n[cohort_n$cohort == cohort_name]
+    if (length(n) == 0) cohort_name else sprintf("%s (n=%d)", cohort_name, n)
+  }
+
+  # Re-key the color vector onto the labelled names so colors stay consistent.
+  labeled_colors <- setNames(
+    unname(cohort_colors),
+    vapply(names(cohort_colors), label_for, character(1))
+  )
+
+  summary_df <- df |>
+    mutate(date = as.Date(date), log_value = log10(.data[[y_col]] + 1)) |>
+    inner_join(demographics, by = "ParticipantId") |>
+    summarise(
+      mean_log = mean(log_value, na.rm = TRUE),
+      se_log = sd(log_value, na.rm = TRUE) / sqrt(sum(!is.na(log_value))),
+      .by = c(cohort, date)
+    ) |>
+    mutate(
+      ci_lo = mean_log - 1.96 * se_log,
+      ci_hi = mean_log + 1.96 * se_log
+    ) |>
+    arrange(cohort, date)
+
+  # Lookup lets each row pull another cohort's mean on the same date
+  by_cohort <- split(summary_df[c("date", "mean_log")], summary_df$cohort)
+
+  lookup_log <- function(cohort_name, on_date) {
+    cohort_data <- by_cohort[[cohort_name]]
+    if (is.null(cohort_data)) {
+      return(NA_real_)
+    }
+    val <- cohort_data$mean_log[cohort_data$date == on_date]
+    if (length(val) == 0) NA_real_ else val[1]
+  }
+
+  # Converts a log-mean difference back to a fold-change ratio
+  format_fold <- function(log_self, log_other, other_name) {
+    if (is.na(log_self) || is.na(log_other)) {
+      return(NA_character_)
+    }
+    ratio <- 10^(log_self - log_other)
+    if (ratio >= 1) {
+      sprintf("%.1fx higher than %s", ratio, other_name)
+    } else {
+      sprintf("%.1fx lower than %s", 1 / ratio, other_name)
+    }
+  }
+
+  comparisons <- list(
+    "No Treatment" = c("DRV", "ETR"),
+    "DRV" = c("No Treatment", "ETR"),
+    "ETR" = c("No Treatment", "DRV")
+  )
+
+  summary_df <- summary_df |>
+    rowwise() |>
+    mutate(hover = {
+      others <- comparisons[[cohort]]
+      fold_lines <- vapply(
+        others,
+        \(other) format_fold(mean_log, lookup_log(other, date), other),
+        character(1)
+      )
+      fold_lines <- fold_lines[!is.na(fold_lines)]
+
+      stat_lines <- c(
+        sprintf(
+          "Log10 mean: %.2f (95%% CI: %.2f–%.2f)",
+          mean_log,
+          ci_lo,
+          ci_hi
+        ),
+        sprintf(
+          "≈ %s copies/mL",
+          format(round(10^mean_log - 1), big.mark = ",")
+        )
+      )
+      paste(c(stat_lines, fold_lines), collapse = "<br>")
+    }) |>
+    ungroup() |>
+    mutate(cohort_label = vapply(cohort, label_for, character(1)))
+
+  summary_df |>
+    plot_ly(
+      x = ~date,
+      y = ~mean_log,
+      color = ~cohort_label,
+      colors = labeled_colors,
+      legendgroup = ~cohort_label
+    ) |>
+    add_ribbons(
+      ymin = ~ci_lo,
+      ymax = ~ci_hi,
+      line = list(width = 0),
+      opacity = 0.4,
+      showlegend = FALSE,
+      hoverinfo = "skip"
+    ) |>
+    add_lines(
+      text = ~hover,
+      hovertemplate = paste0(
+        "%{x|%b %d, %Y}<br>",
+        "%{text}",
+        "<extra>%{fullData.name}</extra>"
+      )
+    ) |>
+    layout(
+      xaxis = list(title = "Visit Date"),
+      yaxis = list(
+        title = paste0("Log10(", prettify_label(y_col), "), mean (95% CI)")
+      ),
+      legend = list(orientation = "h", x = 0, y = -0.25),
+      margin = list(l = 70, r = 20, t = 30, b = 70)
+    )
+}
+
+# Value box helpers ----
+
+darken_hex <- function(hex, factor = 0.65) {
+  rgb_vals <- grDevices::col2rgb(hex) * factor
+  grDevices::rgb(rgb_vals[1], rgb_vals[2], rgb_vals[3], maxColorValue = 255)
+}
+
+stat_box <- function(cohort_name) {
+  color <- cohort_colors[[cohort_name]]
+
+  note_tag <- htmltools::tags$div(
+    style = "color:#000;",
+    "copies/mL at latest visit"
+  )
+
+  value_box(
+    title = htmltools::tags$span(
+      style = sprintf("font-weight:700;color:%s;", darken_hex(color)),
+      cohort_name
+    ),
+    value = htmltools::tags$span(
+      style = sprintf("color:%s;", color),
+      fmt_geo(cohort_name)
+    ),
+    note_tag,
+    theme = "light",
+    height = "175px",
+    fill = FALSE,
+    full_screen = FALSE
+  )
+}
+```
+
+```{r}
+#| include: false
+
+# Load data ----
+
+demographics <- lk_export_rows(
+  "study",
+  "Demographics",
+  columns = "ParticipantId,cohort"
+) |>
+  filter(cohort != "HIVNeg")
+
+viral_pcr <- lk_export_rows("study", "ViralLoad_PCR")
+
+# Render pulls fresh, so render time is the data timestamp.
+data_pulled_at <- format(Sys.time(), "%Y-%m-%d %H:%M UTC", tz = "UTC")
+
+# Summary stats ----
+
+y_col <- first_numeric_col(viral_pcr)
+
+# Join to the HIVNeg-filtered demographics so counts cover only shown cohorts.
+counted <- viral_pcr |>
+  inner_join(demographics, by = "ParticipantId")
+
+cohort_counts <- counted |>
+  summarise(
+    n_participants = n_distinct(ParticipantId),
+    n_obs = n(),
+    .by = cohort
+  )
+
+visits_per_participant <- counted |>
+  count(ParticipantId, name = "n_visits")
+
+overall_counts <- tibble::tibble(
+  n_obs = nrow(counted),
+  n_participants = nrow(visits_per_participant),
+  median_visits = stats::median(visits_per_participant$n_visits)
+)
+
+latest_by_cohort <- viral_pcr |>
+  inner_join(demographics, by = "ParticipantId") |>
+  mutate(date = as.Date(date)) |>
+  filter(date == max(date, na.rm = TRUE), .by = cohort) |>
+  summarise(
+    geo_mean = 10^(mean(log10(.data[[y_col]] + 1), na.rm = TRUE)) - 1,
+    .by = cohort
+  )
+
+# Formatting helpers ----
+
+fmt_geo <- function(cohort_name) {
+  val <- latest_by_cohort$geo_mean[latest_by_cohort$cohort == cohort_name]
+  if (length(val) == 0 || is.na(val)) {
+    return("N/A")
+  }
+  format(round(val), big.mark = ",")
+}
+```
+
+Synthetic LabKey data comparing two antiretroviral regimens against an untreated arm. Participants with HIV receiving no treatment maintained a substantially higher viral load since Janurary 2021 than either treated cohort.
+
+## Row {height="92%"}
+
+### Column {width="70%"}
+
+```{r}
+#| title: "Viral Load by Cohort Over Time (PCR)"
+plot_mean_trend(viral_pcr, demographics)
+```
+
+### Column {width="30%"}
+
+```{r}
+#| expandable: false
+
+stat_box("No Treatment")
+```
+
+```{r}
+#| expandable: false
+
+stat_box("DRV")
+```
+
+```{r}
+#| expandable: false
+
+stat_box("ETR")
+```
+
+## Row {height="8%" .flow}
+
+Data: LabKey public [HIV Study Tutorial](https://www.labkey.org/home/Demos/HIV%20Study%20Tutorial/project-begin.view), `r overall_counts$n_obs` viral-load measurements from `r overall_counts$n_participants` participants (median `r overall_counts$median_visits` visits each). Last refreshed `r data_pulled_at`.
